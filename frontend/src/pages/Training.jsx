@@ -278,6 +278,64 @@ export default function Training() {
               )}
             </div>
           ))}
+          {trace.merchant_attribution && (
+            <div className="trace-box">
+              <h3>商户归属归档（训练时点可见视图）</h3>
+              <p className="small">
+                归档商户 <strong>{trace.merchant_attribution.archive.merchant_id || '—'}</strong> · 可见批次 seq{' '}
+                {trace.merchant_attribution.archive.visible_batch_seq} · 归档于{' '}
+                {trace.merchant_attribution.archive.archived_at}
+              </p>
+              {Object.keys(trace.merchant_attribution.archive.values || {}).length > 0 && (
+                <table>
+                  <thead>
+                    <tr>
+                      <th>特征</th>
+                      <th>值</th>
+                      <th>纳入归属</th>
+                      <th>来源批次</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {Object.entries(trace.merchant_attribution.archive.values).map(([name, v]) => (
+                      <tr key={name}>
+                        <td>{name}</td>
+                        <td>{v.value === null ? 'null' : v.value}</td>
+                        <td className="small">{(v.included_attributions || []).join(', ') || '—'}</td>
+                        <td className="small">{(v.source_batches || []).join(', ') || '—'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+              <p className="small">
+                稳定性：
+                <span className={`badge ${trace.merchant_attribution.stability.stable ? 'current' : 'pending'}`}>
+                  {trace.merchant_attribution.stability.stable ? '归档与现算一致' : '存在后续可见批次带来的差异（归档不改写）'}
+                </span>
+              </p>
+              {trace.merchant_attribution.stability.differences?.length > 0 && (
+                <table>
+                  <thead>
+                    <tr>
+                      <th>特征</th>
+                      <th>归档值</th>
+                      <th>现算值</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {trace.merchant_attribution.stability.differences.map((d) => (
+                      <tr key={d.feature}>
+                        <td>{d.feature}</td>
+                        <td>{d.archived === null ? 'null' : d.archived}</td>
+                        <td>{d.recomputed === null ? 'null' : d.recomputed}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          )}
         </section>
       )}
     </div>

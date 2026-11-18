@@ -11,8 +11,12 @@ from ..models import (
     OnlinePointer,
 )
 
-VALID_SOURCES = {"transactions", "labels", "account_profile"}
-VALID_AGGS = {"COUNT", "SUM", "AVG", "MIN", "MAX", "LAST"}
+VALID_SOURCES = {"transactions", "labels", "account_profile", "merchant_transactions"}
+VALID_AGGS = {"COUNT", "SUM", "AVG", "MIN", "MAX", "LAST", "COUNT_DISTINCT"}
+# Merchant-level features count terminals/stores inside a merchant window.
+MERCHANT_AGGS = {"COUNT", "COUNT_DISTINCT", "SUM", "AVG", "MIN", "MAX"}
+# Dimensions a merchant feature may count distinct over / filter on.
+MERCHANT_DIMENSIONS = {"terminal_id", "store_id", "merchant_id", "account_id", "txn_id"}
 
 
 def validate_feature_spec(spec: dict) -> list[str]:
@@ -27,11 +31,26 @@ def validate_feature_spec(spec: dict) -> list[str]:
             errors.append("account_profile features must use LAST aggregation")
         if not spec.get("field"):
             errors.append("account_profile features require a profile attribute field")
+    elif spec.get("source") == "merchant_transactions":
+        if spec.get("entity_key", "merchant_id") != "merchant_id":
+            errors.append("merchant_transactions features use entity_key='merchant_id'")
+        if not spec.get("window_seconds") or int(spec.get("window_seconds") or 0) <= 0:
+            errors.append("merchant features require a positive window_seconds")
+        if agg not in MERCHANT_AGGS:
+            errors.append(f"merchant features support {sorted(MERCHANT_AGGS)}")
+        if agg == "COUNT_DISTINCT" and spec.get("field") not in MERCHANT_DIMENSIONS:
+            errors.append(f"COUNT_DISTINCT requires field in {sorted(MERCHANT_DIMENSIONS)}")
+        if agg in ("SUM", "AVG", "MIN", "MAX") and spec.get("field") != "amount":
+            errors.append(f"{agg} currently supports field='amount'")
+        if agg == "COUNT" and spec.get("field") not in (None, "txn_id"):
+            errors.append("COUNT merchant features count transactions (field null or txn_id)")
     else:
         if not spec.get("window_seconds") or int(spec.get("window_seconds") or 0) <= 0:
             errors.append("streamed features require a positive window_seconds")
         if agg in ("SUM", "AVG", "MIN", "MAX") and spec.get("field") != "amount":
             errors.append(f"{agg} currently supports field='amount'")
+        if agg == "COUNT_DISTINCT":
+            errors.append("COUNT_DISTINCT is only available for merchant_transactions")
     return errors
 
 
@@ -57,7 +76,7 @@ def create_feature(db: Session, spec: dict, created_by: str) -> Feature:
         version=version,
         description=spec.get("description", ""),
         owner=spec.get("owner", created_by),
-        entity_key=spec.get("entity_key", "account_id"),
+        entity_key=spec.get("entity_key", "merchant_id" if spec["source"] == "merchant_transactions" else "account_id"),
         source=spec["source"],
         aggregation=spec["aggregation"],
         field=spec.get("field"),

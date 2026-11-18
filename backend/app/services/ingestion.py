@@ -110,6 +110,7 @@ def ingest_transactions(db: Session, events: list[dict]) -> dict:
                 type=ev.get("type", "purchase"),
                 status=ev.get("status", "completed"),
                 merchant_id=ev.get("merchant_id", ""),
+                terminal_id=ev.get("terminal_id", ""),
             )
         )
 

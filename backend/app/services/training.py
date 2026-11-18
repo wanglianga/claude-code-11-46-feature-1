@@ -60,6 +60,15 @@ def create_sample(
     db.add(sample)
     db.commit()
     db.refresh(sample)
+    # Training-explainability module: archive the attribution view visible at
+    # the sample's decision time. Later master batches never touch this row.
+    try:
+        from . import evidence as evidence_service
+
+        evidence_service.archive_sample_attribution(db, sample=sample)
+    except Exception:  # pragma: no cover - archive must not block sample creation
+        db.rollback()
+    db.refresh(sample)
     return sample
 
 
@@ -192,6 +201,25 @@ def trace_sample(
         "label_record": label_record,
         "feature_set": {"name": version_row.name, "version": version_row.version},
         "features": feature_traces,
+        "merchant_attribution": _sample_attribution_trace(db, sample),
+    }
+
+
+def _sample_attribution_trace(db: Session, sample: TrainingSample) -> dict | None:
+    """Training-explainability module view of the sample's attribution: the
+    archived decision-time snapshot plus a stability check against the live
+    recomputation (never a rewrite of the archive itself)."""
+    from ..models import SampleAttributionArchive
+    from . import evidence as evidence_service
+
+    archive = db.execute(
+        select(SampleAttributionArchive).where(SampleAttributionArchive.sample_id == sample.id)
+    ).scalar_one_or_none()
+    if archive is None:
+        return None
+    return {
+        "archive": evidence_service.sample_archive_out(archive),
+        "stability": evidence_service.verify_sample_archive(db, sample, archive),
     }
 
 

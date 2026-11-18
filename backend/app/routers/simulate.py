@@ -8,6 +8,8 @@ from ..models import SourceStatus, User
 from ..schemas import (
     SimulateAccountsIn,
     SimulateLabelsIn,
+    SimulateMerchantMasterIn,
+    SimulateMerchantTransactionsIn,
     SimulateTransactionsIn,
     SourceOutageIn,
 )
@@ -51,6 +53,26 @@ def simulate_labels(
 ):
     return simulation.simulate_labels(
         db, body.fraud_rate, body.min_delay_days, body.max_delay_days, body.seed
+    )
+
+
+@router.post("/simulate/merchant-master")
+def simulate_merchant_master(
+    body: SimulateMerchantMasterIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    return simulation.simulate_merchant_master(db, body.seed)
+
+
+@router.post("/simulate/merchant-transactions")
+def simulate_merchant_transactions(
+    body: SimulateMerchantTransactionsIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    return simulation.simulate_merchant_transactions(
+        db, count=body.count, span_hours=body.span_hours, seed=body.seed
     )
 
 

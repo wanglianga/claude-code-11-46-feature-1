@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from ..models import SourceStatus, Transaction
+from ..models import AttributionBatch, SourceStatus, Transaction
 from . import ingestion
 
 
@@ -141,3 +141,68 @@ def set_source_outage(db: Session, source: str, status: str, message: str = "") 
         "message": row.message,
         "last_success_at": row.last_success_at.isoformat() if row.last_success_at else None,
     }
+
+
+def simulate_merchant_master(db: Session, seed: int = 42) -> dict:
+    """Seed a small merchant universe for the attribution walkthrough.
+
+    Reuses the seeded terminal baseline (T1001..T1005) plus a few extra
+    terminals so that migration / corrections have material to act on.
+    """
+    from . import attribution as attribution_service
+
+    batch_key = "B-SIM-MASTER"
+    existing = db.execute(
+        select(AttributionBatch.id).where(AttributionBatch.batch_key == batch_key)
+    ).scalar_one_or_none()
+    if existing is not None:
+        return {"batch_key": batch_key, "status": "already_present"}
+    result = attribution_service.ingest_batch(
+        db,
+        batch_key=batch_key,
+        reason="initial",
+        source="merchant_master",
+        note="模拟商户主档：M110 扩展终端，M120 新门店",
+        relations=[
+            dict(terminal_id="T1006", store_id="S-M110-02", merchant_id="M110",
+                 confidence="high", effective_from="2026-01-01T00:00:00+00:00"),
+            dict(terminal_id="T1007", store_id="S-M120-02", merchant_id="M120",
+                 confidence="high", effective_from="2026-01-01T00:00:00+00:00"),
+        ],
+        created_by="simulation",
+    )
+    return {"batch_key": batch_key, "status": "created", "seq": result["seq"]}
+
+
+def simulate_merchant_transactions(
+    db: Session,
+    count: int = 60,
+    span_hours: int = 168,
+    seed: int = 42,
+) -> dict:
+    """Generate merchant-terminal transactions spread over the last span."""
+    rng = random.Random(seed)
+    terminals = [
+        ("T1001", "ACC-M-01"), ("T1002", "ACC-M-01"), ("T1003", "ACC-M-02"),
+        ("T1004", "ACC-M-03"), ("T1005", "ACC-M-03"), ("T1006", "ACC-M-02"),
+        ("T1007", "ACC-M-04"),
+    ]
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    events = []
+    for i in range(count):
+        terminal_id, account = rng.choice(terminals)
+        events.append(
+            {
+                "txn_id": f"MTXN-{seed}-{i:05d}",
+                "account_id": account,
+                "event_time": now - timedelta(seconds=rng.randint(60, span_hours * 3600)),
+                "amount": round(rng.uniform(5, 3000), 2),
+                "currency": "CNY",
+                "type": "purchase",
+                "status": "completed",
+                "merchant_id": "",
+                "terminal_id": terminal_id,
+            }
+        )
+    events.sort(key=lambda e: e["event_time"])
+    return ingestion.ingest_transactions(db, events)

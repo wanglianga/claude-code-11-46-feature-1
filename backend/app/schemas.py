@@ -44,6 +44,7 @@ class TransactionEventIn(BaseModel):
     type: str = "purchase"
     status: str = "completed"
     merchant_id: str = ""
+    terminal_id: str = ""
 
 
 class LabelEventIn(BaseModel):
@@ -104,3 +105,43 @@ class SourceOutageIn(BaseModel):
     source: str = Field(pattern="^(transactions|account_profiles|labels)$")
     status: str = Field(pattern="^(ok|degraded|unavailable)$")
     message: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Merchant attribution
+# ---------------------------------------------------------------------------
+class AttributionRelationIn(BaseModel):
+    terminal_id: str
+    store_id: str
+    merchant_id: str
+    effective_from: datetime
+    effective_to: datetime | None = None
+    confidence: str = "high"  # high | medium | low
+    mode: str = "supersede"  # supersede | coexist
+    note: str = ""
+
+
+class AttributionBatchIn(BaseModel):
+    batch_key: str
+    reason: str = "batch_correction"
+    source: str = "merchant_master"
+    note: str = ""
+    visible_at: datetime | None = None
+    relations: list[AttributionRelationIn]
+
+
+class MerchantScoreIn(BaseModel):
+    merchant_id: str
+    feature_set: str = "merchant_risk"
+    set_version: int | None = None
+    as_of: datetime | None = None
+
+
+class SimulateMerchantTransactionsIn(BaseModel):
+    count: int = 60
+    span_hours: int = 168
+    seed: int = 42
+
+
+class SimulateMerchantMasterIn(BaseModel):
+    seed: int = 42

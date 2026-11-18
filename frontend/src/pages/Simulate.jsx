@@ -60,6 +60,26 @@ export default function Simulate() {
             3. 生成延迟拒付/核查标签
           </button>
           <ResultBox result={results.labels} />
+          <button
+            className="btn"
+            disabled={!!busy}
+            onClick={() => run('master', () => api.post('/api/simulate/merchant-master', { seed: 42 }))}
+          >
+            4. 生成商户主档（终端 M110/M120 扩展）
+          </button>
+          <ResultBox result={results.master} />
+          <button
+            className="btn"
+            disabled={!!busy}
+            onClick={() =>
+              run('merchantTxns', () =>
+                api.post('/api/simulate/merchant-transactions', { count: 60, span_hours: 168, seed: 42 }),
+              )
+            }
+          >
+            5. 生成商户终端交易流（60 笔 × 7 天）
+          </button>
+          <ResultBox result={results.merchantTxns} />
         </div>
       </section>
 
@@ -101,6 +121,9 @@ export default function Simulate() {
             <li>到「训练样本」以某笔交易时间创建样本并「追溯」，对比同一 as_of 的在线值。</li>
             <li>点击「模拟账户源中断」后再次在线查询：账户类特征显示 unavailable 而非 0。</li>
             <li>到「特征目录」勾选特征发布新版本，发布期间在线查询始终读取完整单一版本。</li>
+            <li>按 4→5 生成商户主档与终端交易，到「归属修订」读取 M110 的「近七日同商户终端数」。</li>
+            <li>在「归属修订」提交一个终端迁店批次（supersede），观察影响交易数、精确重算快照数与窗口修订。</li>
+            <li>提交 coexist 重叠区间或 low 置信关系，确认在线读取返回 needs_review 与候选关系而非任选一条。</li>
           </ol>
         </div>
       </section>

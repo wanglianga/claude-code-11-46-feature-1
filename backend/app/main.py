@@ -1,6 +1,7 @@
 """FastAPI application entrypoint. Creates schema and seeds the demo catalog
 (users, source statuses, the default fraud_scoring feature set) idempotently."""
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,8 +9,19 @@ from sqlalchemy import select
 
 from .config import settings
 from .db import Base, SessionLocal, engine
-from .models import Feature, SourceStatus, User
-from .routers import auth, compute, features, ingest, online, simulate, training
+from .models import AttributionBatch, Feature, SourceStatus, User
+from .routers import (
+    attribution,
+    auth,
+    compute,
+    evidence,
+    features,
+    ingest,
+    merchant,
+    online,
+    simulate,
+    training,
+)
 from .security import hash_password
 from .services.features import publish_feature_set
 
@@ -18,7 +30,36 @@ SEED_USERS = [
     ("admin", "admin123", "admin"),
 ]
 
-SEED_SOURCES = ["transactions", "account_profiles", "labels"]
+SEED_SOURCES = ["transactions", "account_profiles", "labels", "merchant_master"]
+
+# Merchant-level features. `merchant_terminal_count_7d` (近七日同商户终端数) is
+# the one that depends on the terminal→store→merchant attribution.
+SEED_MERCHANT_FEATURES = [
+    dict(name="merchant_txn_count_7d", source="merchant_transactions", aggregation="COUNT",
+         window_seconds=604800, description="近7天同商户交易笔数", owner="risk-ops"),
+    dict(name="merchant_terminal_count_7d", source="merchant_transactions",
+         aggregation="COUNT_DISTINCT", field="terminal_id", window_seconds=604800,
+         description="近七日同商户终端数（依赖终端→门店→商户归属）", owner="risk-ops"),
+    dict(name="merchant_amount_sum_1d", source="merchant_transactions", aggregation="SUM",
+         field="amount", window_seconds=86400, description="近24小时同商户交易金额合计",
+         owner="risk-ops"),
+    dict(name="merchant_txn_count_1h", source="merchant_transactions", aggregation="COUNT",
+         window_seconds=3600, description="近1小时同商户交易笔数", owner="risk-ops"),
+]
+
+# Initial merchant master batch: two stores under M110 and one under M120.
+SEED_ATTRIBUTIONS = [
+    dict(terminal_id="T1001", store_id="S-M110-01", merchant_id="M110", confidence="high",
+         effective_from="2026-01-01T00:00:00+00:00"),
+    dict(terminal_id="T1002", store_id="S-M110-01", merchant_id="M110", confidence="high",
+         effective_from="2026-01-01T00:00:00+00:00"),
+    dict(terminal_id="T1003", store_id="S-M110-02", merchant_id="M110", confidence="high",
+         effective_from="2026-01-01T00:00:00+00:00"),
+    dict(terminal_id="T1004", store_id="S-M120-01", merchant_id="M120", confidence="high",
+         effective_from="2026-01-01T00:00:00+00:00"),
+    dict(terminal_id="T1005", store_id="S-M120-01", merchant_id="M120", confidence="medium",
+         effective_from="2026-01-01T00:00:00+00:00"),
+]
 
 # Default feature catalog for the fraud_scoring set (all windows are
 # event-time sliding windows; profile features read the latest daily snapshot).
@@ -70,6 +111,16 @@ def seed(db) -> None:
                 status="draft", created_by="seed",
             )
             db.add(feature)
+        for spec in SEED_MERCHANT_FEATURES:
+            db.add(Feature(
+                name=spec["name"], version=1,
+                description=spec.get("description", ""),
+                owner=spec.get("owner", "risk-ops"),
+                entity_key="merchant_id",
+                source=spec["source"], aggregation=spec["aggregation"],
+                field=spec.get("field"), window_seconds=spec.get("window_seconds"),
+                value_type="number", status="draft", created_by="seed",
+            ))
         db.commit()
         publish_feature_set(
             db,
@@ -78,14 +129,58 @@ def seed(db) -> None:
             note="initial seed release",
             created_by="seed",
         )
+        publish_feature_set(
+            db,
+            "merchant_risk",
+            [{"name": spec["name"], "version": 1} for spec in SEED_MERCHANT_FEATURES],
+            note="initial merchant attribution release",
+            created_by="seed",
+        )
+
+    # Seed the initial merchant master batch only if no batch exists yet.
+    if db.execute(select(AttributionBatch).limit(1)).scalar_one_or_none() is None:
+        from .services import attribution as attribution_service
+
+        attribution_service.ingest_batch(
+            db,
+            batch_key="B-SEED-MASTER",
+            relations=SEED_ATTRIBUTIONS,
+            reason="initial",
+            source="merchant_master",
+            note="初始终端-门店-商户关系基线",
+            visible_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            created_by="seed",
+        )
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(engine)
+    _ensure_dev_columns()
     with SessionLocal() as db:
         seed(db)
     yield
+
+
+def _ensure_dev_columns() -> None:
+    """Additive dev-schema compatibility. `create_all` never alters existing
+    tables, so a database created by an earlier build would miss the terminal
+    column. Production deployments use migrations; this keeps local upgrades
+    one-command without dropping data."""
+    from sqlalchemy import text
+
+    statements = [
+        "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS terminal_id VARCHAR(64) NOT NULL DEFAULT ''",
+        "CREATE INDEX IF NOT EXISTS ix_transactions_terminal_id ON transactions (terminal_id)",
+        "ALTER TABLE merchant_attributions ADD COLUMN IF NOT EXISTS retired_at_seq INTEGER",
+        "ALTER TABLE merchant_window_snapshots ADD COLUMN IF NOT EXISTS attribution_marker INTEGER NOT NULL DEFAULT 0",
+    ]
+    with engine.begin() as conn:
+        for stmt in statements:
+            try:
+                conn.execute(text(stmt))
+            except Exception:  # pragma: no cover - table may not exist yet
+                pass
 
 
 app = FastAPI(
@@ -110,6 +205,9 @@ app.include_router(compute.router)
 app.include_router(online.router)
 app.include_router(training.router)
 app.include_router(simulate.router)
+app.include_router(merchant.router)
+app.include_router(attribution.router)
+app.include_router(evidence.router)
 
 
 @app.get("/api/health")

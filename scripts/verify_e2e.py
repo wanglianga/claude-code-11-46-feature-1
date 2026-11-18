@@ -9,6 +9,9 @@ Exercises the acceptance criteria over HTTP:
   5. publishing mid-traffic never mixes versions
   6. offline (training replay) and online reads at the same as_of match
   7. unavailable account source reports status instead of fake zeros
+  8. merchant attribution revision impact: terminal migration scope, overlap /
+     low-confidence review reasons, archived samples and scoring evidence stay
+     immutable, peak reads hit expanded snapshots, offline/online alignment
 
 Usage:  python scripts/verify_e2e.py [base_url]
 Requires the backend running (default http://127.0.0.1:8000) with a fresh-ish
@@ -62,6 +65,30 @@ def txn(i, account, event_time, amount):
         "status": "completed",
         "merchant_id": "M100",
     }
+
+
+def txn_merchant(i, account, event_time, amount, terminal_id):
+    return {
+        "txn_id": f"MTXN-E2E-{RUN}-{i}",
+        "account_id": account,
+        "event_time": event_time,
+        "amount": amount,
+        "currency": "CNY",
+        "type": "purchase",
+        "status": "completed",
+        "merchant_id": "",
+        "terminal_id": terminal_id,
+    }
+
+
+def merchant_vals(token, merchant, as_of, **params):
+    q = urllib.parse.urlencode({"entity_id": merchant, "as_of": as_of, **params})
+    resp = req("GET", f"/api/online/merchant-features?{q}", token=token)
+    return {f["name"]: f["value"] for f in resp["features"]}, resp
+
+
+def merchant_feature(resp, name):
+    return next(f for f in resp["features"] if f["name"] == name)
 
 
 def online_vals(token, account, as_of, **params):
@@ -175,7 +202,168 @@ def main():
     check("交易类特征不受账户源影响", cnt["status"] == "ok")
     req("POST", "/api/sources/outage", {"source": "account_profiles", "status": "ok", "message": ""}, token)
 
+    # --- 8. merchant attribution revision impact -----------------------------
+    run_attribution_checks(token, now, t)
+
     print(f"\n全部 {len(passed)} 项端到端验收检查通过。")
+
+
+def run_attribution_checks(token, now, t):
+    # Merchant windows are scoped to terminals related to the merchant under
+    # test, and every resource id below is unique to this run, so re-running
+    # against an accumulated database stays isolated.
+    run = uuid.uuid4().hex[:6]
+    m_old, m_new = f"M-E2E-{run}-A", f"M-E2E-{run}-B"
+    term = f"T-E2E-{run}"
+    overlap_merchant = f"M-E2E-{run}-C"
+    low_term = f"T-E2E-{run}-LOW"
+    low_merchant = f"M-E2E-{run}-LOW"
+    acc = f"ACC-E2E-M-{run}"
+
+    # initial master batch for this run's terminal
+    base_from = t(days=-30)
+    req("POST", "/api/attribution/batches", {
+        "batch_key": f"B-E2E-BASE-{run}", "reason": "initial",
+        "visible_at": t(days=-30),
+        "relations": [{"terminal_id": term, "store_id": f"S-{run}-01",
+                       "merchant_id": m_old, "effective_from": base_from,
+                       "confidence": "high"}],
+    }, token)
+
+    # Three transactions: two before the migration, one after. All are ingested
+    # before the correcting batch, and M_old's window is materialized now, so
+    # the batch must revise exactly the already-seen post-migration window.
+    migrate_at = t(hours=-3)
+    req("POST", "/api/ingest/transactions", [
+        FIRST_TXN := txn_merchant("1", acc, t(hours=-6), 100.0, term),
+        txn_merchant("2", acc, t(hours=-5), 50.0, term),
+        txn_merchant("3", acc, t(hours=-1), 70.0, term),
+    ], token)
+    vals, _ = merchant_vals(token, m_old, t(hours=-4))
+    check("迁移前同商户终端数=1", vals["merchant_terminal_count_7d"] == 1,
+          f"got {vals.get('merchant_terminal_count_7d')}")
+    check("迁移前同商户交易笔数=2", vals["merchant_txn_count_7d"] == 2)
+    # Materialize M_old's current 7d window too (contains all three txns).
+    pre_mig, _ = merchant_vals(token, m_old, t(minutes=0))
+    check("纠错前窗口包含迁移后交易", pre_mig["merchant_txn_count_7d"] == 3,
+          f"got {pre_mig.get('merchant_txn_count_7d')}")
+
+    migration = req("POST", "/api/attribution/batches", {
+        "batch_key": f"B-E2E-MIG-{run}", "reason": "terminal_migration",
+        "note": "e2e 终端迁店", "visible_at": migrate_at,
+        "relations": [{"terminal_id": term, "store_id": f"S-{run}-02",
+                       "merchant_id": m_new, "effective_from": migrate_at,
+                       "confidence": "high", "mode": "supersede"}],
+    }, token)
+    impact = req("GET", f"/api/attribution/batches/{migration['id']}", token=token)["impact"]
+    check("迁店影响范围仅包含迁移后交易",
+          impact["affected_transaction_count"] == 1
+          and [x["txn_id"] for x in impact["affected_transactions"]] == [f"MTXN-E2E-{RUN}-3"],
+          f"impact={impact['affected_transactions']}")
+    check("纠错精确重算受影响已展开窗口",
+          impact["affected_snapshots"] >= 1 and impact["revisions"] >= 1,
+          f"snapshots={impact['affected_snapshots']} revisions={impact['revisions']}")
+
+    old_vals, _ = merchant_vals(token, m_old, t(minutes=0))
+    new_vals, _ = merchant_vals(token, m_new, t(minutes=0))
+    check("迁店后原商户不再计入新交易", old_vals["merchant_txn_count_7d"] == 2,
+          f"got {old_vals.get('merchant_txn_count_7d')}")
+    check("迁店后新商户计入迁移后交易", new_vals["merchant_txn_count_7d"] == 1)
+
+    revs = req("GET", "/api/merchant/window-revisions?limit=200", token=token)
+    check("主档修订生成窗口修订审计",
+          any(r["merchant_id"] == m_old and r["batch_id"] == migration["id"] for r in revs))
+
+    # archived sample + evidence immutability across a backdated correction
+    sample = req("POST", "/api/training/samples", {
+        "sample_key": f"S-E2E-M-{run}", "entity_id": acc,
+        "decision_time": t(hours=-4), "transaction_id": FIRST_TXN["txn_id"],
+    }, token)
+    scored = req("GET", f"/api/online/merchant-features?entity_id={m_old}&as_of={urllib.parse.quote(t(hours=-4))}&record_evidence=true", token=token)
+    ev_id = scored["evidence"]["id"]
+    ev_before = req("GET", f"/api/evidence/{ev_id}", token=token)
+    trace_before = req("GET", f"/api/training/samples/{sample['id']}/trace", token=token)
+    archive_before = trace_before["merchant_attribution"]["archive"]
+
+    req("POST", "/api/attribution/batches", {
+        "batch_key": f"B-E2E-CORR-{run}", "reason": "batch_correction",
+        "visible_at": t(days=-10),
+        "relations": [{"terminal_id": term, "store_id": f"S-{run}-00",
+                       "merchant_id": f"M-E2E-{run}-Z", "effective_from": t(days=-60),
+                       "confidence": "high"}],
+    }, token)
+    ev_after = req("GET", f"/api/evidence/{ev_id}", token=token)
+    trace_after = req("GET", f"/api/training/samples/{sample['id']}/trace", token=token)
+    check("评分证据的摘要与载荷不被主档修订改写",
+          ev_after["digest"] == ev_before["digest"]
+          and ev_after["payload"] == ev_before["payload"]
+          and ev_after["integrity"]["immutable"] is True)
+    check("归档训练样本的归属视图不变",
+          trace_after["merchant_attribution"]["archive"] == archive_before
+          and archive_before["merchant_id"] == m_old)
+    check("样本稳定性检查报告差异但不改写",
+          trace_after["merchant_attribution"]["stability"]["stable"] is False)
+    check("异常评分可追溯关系来源与有效区间",
+          all(k in ev_after["payload"]["attribution_context"]["transactions"][0]["attribution"]
+              for k in ("batch_key", "effective_from", "candidates")))
+
+    # overlapping valid relations -> needs_review, not arbitrary choice
+    overlap_from, overlap_to = t(hours=-8), t(hours=-2)
+    req("POST", "/api/attribution/batches", {
+        "batch_key": f"B-E2E-OVL-{run}", "reason": "batch_correction",
+        "visible_at": overlap_from,
+        "relations": [{"terminal_id": term, "store_id": f"S-{run}-03",
+                       "merchant_id": overlap_merchant, "effective_from": overlap_from,
+                       "effective_to": overlap_to, "confidence": "medium",
+                       "mode": "coexist"}],
+    }, token)
+    ovl_vals, ovl_resp = merchant_vals(token, overlap_merchant, t(hours=-4))
+    ovl_feat = merchant_feature(ovl_resp, "merchant_terminal_count_7d")
+    check("区间重叠返回待核对而非任选归属",
+          ovl_feat["status"] == "needs_review"
+          and ovl_feat["needs_review_reasons"].get("overlapping_intervals", 0) >= 1
+          and ovl_feat["value"] == 0,
+          f"feat={ovl_feat.get('status')} reasons={ovl_feat.get('needs_review_reasons')}")
+    item = next(i for i in ovl_feat["review_items"]
+                if i["txn_id"] == f"MTXN-E2E-{RUN}-2")
+    cand_merchants = {c["merchant_id"] for c in item["candidates"]}
+    check("待核对项列出全部候选关系（含新重叠商户与既有纠错归属）",
+          len(cand_merchants) >= 2 and overlap_merchant in cand_merchants,
+          f"candidates={sorted(cand_merchants)}")
+
+    # low-confidence-only -> needs_review
+    req("POST", "/api/attribution/batches", {
+        "batch_key": f"B-E2E-LOW-{run}", "reason": "batch_correction",
+        "visible_at": t(days=-2),
+        "relations": [{"terminal_id": low_term, "store_id": f"S-{run}-LOW",
+                       "merchant_id": low_merchant, "effective_from": t(days=-30),
+                       "confidence": "low"}],
+    }, token)
+    req("POST", "/api/ingest/transactions", [txn_merchant("L", acc, t(hours=-1), 20.0, low_term)], token)
+    low_vals, low_resp = merchant_vals(token, low_merchant, t(minutes=0))
+    low_feat = merchant_feature(low_resp, "merchant_terminal_count_7d")
+    check("仅低置信映射返回待核对原因",
+          low_feat["status"] == "needs_review"
+          and low_feat["needs_review_reasons"].get("low_confidence") == 1
+          and low_feat["value"] == 0)
+
+    # peak query: a scoring instant not read before materializes once, then
+    # every repeat read at that same instant hits the expanded snapshot
+    peak_as_of = t(minutes=-17)
+    _, p1 = merchant_vals(token, m_new, peak_as_of)
+    _, p2 = merchant_vals(token, m_new, peak_as_of)
+    check("高峰重复查询命中已展开归属快照",
+          merchant_feature(p1, "merchant_terminal_count_7d")["cache"] == "miss"
+          and merchant_feature(p2, "merchant_terminal_count_7d")["cache"] == "hit",
+          f"p1={merchant_feature(p1, 'merchant_terminal_count_7d')['cache']} "
+          f"p2={merchant_feature(p2, 'merchant_terminal_count_7d')['cache']}")
+
+    # offline/online same caliber at the same scoring instant
+    snap_id = merchant_feature(p2, "merchant_terminal_count_7d")["snapshot_id"]
+    snap = req("GET", f"/api/merchant/snapshots/{snap_id}", token=token)
+    check("离线/在线使用同一归属版本",
+          snap["summary"]["visible_batch_seq"]
+          == merchant_feature(p2, "merchant_terminal_count_7d")["visible_batch_seq"])
 
 
 if __name__ == "__main__":
